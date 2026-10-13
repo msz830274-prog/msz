@@ -1,8 +1,12 @@
 import os
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QCursor, QAction, QPalette
-from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QLabel, QWidget, 
-                          QMenu, QSystemTrayIcon, QFrame, QMessageBox, QHBoxLayout, QLineEdit, QPushButton, QFileDialog, QDialog, QFormLayout, QDialogButtonBox, QComboBox, QApplication)
+from PyQt6.QtWidgets import (
+    QMainWindow, QVBoxLayout, QLabel, QWidget, QCheckBox,
+    QMenu, QSystemTrayIcon, QFrame, QMessageBox, QHBoxLayout, 
+    QLineEdit, QPushButton, QFileDialog, QDialog, QFormLayout, 
+    QDialogButtonBox, QComboBox, QApplication
+)
 import logging
 import yaml
 import sys
@@ -10,6 +14,8 @@ import platform
 import pathlib
 
 from src.core.ocr_thread import OCRThread
+from src.core.hotkey_manager import GlobalHotkeyThread
+from src.ui.snipper_widget import SnipperWidget
 from src.ui.preview_window import PreviewWindow
 from src.utils.logging_config import setup_logging
 from ..core.resource_path import get_resource_path
@@ -19,50 +25,74 @@ logger = logging.getLogger(__name__)
 
 APP_NAME = "SnipasteOCR"
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # Initialize logging
         setup_logging()
         
-        # 创建中心部件
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         
         self.ocrThread = None
         self.preview_window = None
         self.preview_enabled = True
+        self.pinned_windows = []
         
-        # 添加翻译设置
+        # 快捷键配置 (全面对接 Snipaste 使用习惯)
+        self.hotkeys = {
+            'snip': 'F1',
+            'snip_and_pin': 'F4',
+            'clipboard_pin': 'F3'
+        }
+        self.auto_translate = False
+        
+        # 翻译设置（默认免配置免费翻译）
         self.translation_settings = {
+            'provider': 'free',
             'secret_id': '',
             'secret_key': '',
             'from_lang': 'auto',
             'to_lang': 'zh'
         }
+        # 默认关闭所有后台文件监听与剪贴板监听，实现零内存/零CPU空闲开销
+        self.monitor_folder_enabled = False
+        self.clipboard_monitor_enabled = False
+        
+        # 屏幕框选截图器 (内置 Snipaste 工具栏与 8 点调整)
+        self.snipper_widget = SnipperWidget()
+        self.snipper_widget.action_triggered.connect(self.on_snipper_action)
+        
+        # 全局快捷键线程与活跃工作线程管理
+        self.hotkey_thread = None
+        self.active_workers = set()
+        
+        # 剪贴板监听状态变量
+        self._last_clipboard_hash = None
+        self._is_internal_copy = False
         
         # 检测系统是否为暗色模式
         self.is_dark_mode = self.check_dark_mode()
         
         self.initUI()
-        self.initData()
-        self.initStyle()
         self.initLayout()
+        self.loadConfig()
+        self.initData()
+        self.initHotkeys()
+        self.initStyle()
         
-        # 创建翻译设置菜单
         self.create_translation_settings_menu()
         
     def initUI(self):
         self.setObjectName("MainWindow")
-        self.setGeometry(0, 0, 450, 300)
+        self.setGeometry(0, 0, 520, 420)
         self.setFixedSize(self.size())
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        # 设置窗口图标
+        
         icon_path = get_resource_path('assets/icon.png')
         self.setWindowIcon(QIcon(icon_path))
-        self.setWindowTitle('SnipasteOCR')
+        self.setWindowTitle('SnipasteOCR - 智能截屏贴图翻译器')
         
-        # 初始化到屏幕中间
         screen = QApplication.primaryScreen().geometry()
         size = self.geometry()
         self.move(int((screen.width() - size.width()) / 2), int((screen.height() - size.height()) / 2))
@@ -71,38 +101,50 @@ class MainWindow(QMainWindow):
         self.setupTrayIcon()
         
     def create_translation_settings_menu(self):
-        # 创建设置菜单
         menubar = self.menuBar()
         settings_menu = menubar.addMenu('设置')
         
-        # 添加翻译设置选项
-        translation_action = QAction('翻译设置', self)
-        translation_action.triggered.connect(self.show_translation_settings)
-        settings_menu.addAction(translation_action)
+        settings_action = QAction('首选项与翻译设置', self)
+        settings_action.triggered.connect(self.show_translation_settings)
+        settings_menu.addAction(settings_action)
 
     def setupMainWindow(self):
         pass
 
     def setupTrayIcon(self):
-        # 系统托盘
         self.trayIconMenu = QMenu(self)
         self.trayIconMenu.setObjectName("trayMenu")
         
-        # 添加程序标题（不可点击）
         titleAction = QAction(APP_NAME, self)
         titleAction.setIcon(QIcon(get_resource_path('assets/icon.png')))
         titleAction.setEnabled(False)
         self.trayIconMenu.addAction(titleAction)
         
         self.trayIconMenu.addSeparator()
+
+        # 快捷操作菜单
+        snip_label = f"✂️ 截屏 ({self.hotkeys.get('snip', 'F1')})"
+        self.traySnipAction = QAction(snip_label, self)
+        self.traySnipAction.triggered.connect(self.start_standard_snip)
+        self.trayIconMenu.addAction(self.traySnipAction)
+
+        fast_label = f"⚡ 极速截屏翻译 ({self.hotkeys.get('snip_and_pin', 'F4')})"
+        self.trayFastAction = QAction(fast_label, self)
+        self.trayFastAction.triggered.connect(self.start_fast_snip_and_pin)
+        self.trayIconMenu.addAction(self.trayFastAction)
+
+        clip_label = f"📌 贴图 ({self.hotkeys.get('clipboard_pin', 'F3')})"
+        self.trayClipAction = QAction(clip_label, self)
+        self.trayClipAction.triggered.connect(self.start_clipboard_pin)
+        self.trayIconMenu.addAction(self.trayClipAction)
+
+        self.trayIconMenu.addSeparator()
         
-        # 显示/隐藏主窗口
         self.toggleWindowAction = QAction("显示主窗口", self)
         self.toggleWindowAction.setIcon(QIcon(get_resource_path('assets/icon.png')))
         self.toggleWindowAction.triggered.connect(self.toggleWindow)
         self.trayIconMenu.addAction(self.toggleWindowAction)
         
-        # 重启选项
         restartAction = QAction("重启程序", self)
         restartAction.setIcon(QIcon(get_resource_path('assets/icon.png')))
         restartAction.triggered.connect(self.restart)
@@ -110,7 +152,6 @@ class MainWindow(QMainWindow):
         
         self.trayIconMenu.addSeparator()
         
-        # 添加帮助菜单
         helpMenu = QMenu("帮助", self)
         helpMenu.setIcon(QIcon(get_resource_path('assets/icon.png')))
         
@@ -126,7 +167,6 @@ class MainWindow(QMainWindow):
         
         self.trayIconMenu.addSeparator()
         
-        # 退出选项
         self.quitAction = QAction("退出", self)
         self.quitAction.setIcon(QIcon(get_resource_path('assets/icon.png')))
         self.quitAction.triggered.connect(self.quit)
@@ -136,10 +176,11 @@ class MainWindow(QMainWindow):
         self.trayIcon.setContextMenu(self.trayIconMenu)
         self.trayIcon.setIcon(QIcon(get_resource_path('assets/icon.png')))
         self.trayIcon.activated.connect(self.iconActivated)
-        self.trayIcon.setToolTip(f"{APP_NAME} - 截图自动识别")
+        self.trayIcon.setToolTip(f"{APP_NAME} - 截图定屏翻译")
         self.trayIcon.show()
 
     def initData(self):
+        """初始化 OCR 引擎线程"""
         if self.ocrThread is None or not self.ocrThread.isRunning():
             try:
                 self.ocrThread = OCRThread()
@@ -150,15 +191,129 @@ class MainWindow(QMainWindow):
                     self.preview_button.setEnabled(True)
                     self.preview_button.setToolTip('')
             except Exception as e:
-                 logger.error(f"Failed to initialize or start OCR thread: {str(e)}")
-                 self.show_ocr_error(f"启动OCR服务时出错: {str(e)}\n请检查配置文件和模型路径。")
-                 if hasattr(self, 'preview_button'):
-                     self.preview_button.setEnabled(False)
-                     self.preview_button.setToolTip('OCR服务启动失败')
+                logger.error(f"Failed to initialize OCR thread: {e}")
+                self.show_ocr_error(f"启动OCR服务出错: {e}\n请检查模型路径。")
+                if hasattr(self, 'preview_button'):
+                    self.preview_button.setEnabled(False)
+                    self.preview_button.setToolTip('OCR服务启动失败')
+
+    def initHotkeys(self):
+        """初始化全局快捷键监听"""
+        try:
+            if self.hotkey_thread and self.hotkey_thread.isRunning():
+                self.hotkey_thread.stop()
+            self.hotkey_thread = GlobalHotkeyThread(
+                snip_hotkey=self.hotkeys.get('snip', 'F1'),
+                snip_fast_hotkey=self.hotkeys.get('snip_and_pin', 'F4'),
+                clipboard_hotkey=self.hotkeys.get('clipboard_pin', 'F3')
+            )
+            self.hotkey_thread.snip_triggered.connect(self.start_standard_snip)
+            self.hotkey_thread.snip_fast_triggered.connect(self.start_fast_snip_and_pin)
+            self.hotkey_thread.clipboard_triggered.connect(self.start_clipboard_pin)
+            self.hotkey_thread.error_signal.connect(self.show_ocr_error)
+            self.hotkey_thread.start()
+            logger.info("Global hotkeys initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to init hotkeys: {e}")
+
+    def get_ocr_processor(self):
+        """获取共享的 OCR 处理器实例（按需延迟加载）"""
+        if self.ocrThread and hasattr(self.ocrThread, 'get_ocr_processor'):
+            return self.ocrThread.get_ocr_processor()
+        return None
+
+    def start_standard_snip(self):
+        """触发 Snipaste 交互截图 (F1)"""
+        logger.info("Triggered standard snip")
+        self.snipper_widget.start_snip(fast_mode=False, auto_translate=self.auto_translate)
+
+    def start_fast_snip_and_pin(self):
+        """触发极速截屏直接翻译贴图 (F4)"""
+        logger.info("Triggered fast snip and pin")
+        self.snipper_widget.start_snip(fast_mode=True, auto_translate=True)
+
+    def on_snipper_action(self, pixmap, rect, action_type):
+        """处理截屏工具栏发出的动作"""
+        logger.info(f"Snipper action: {action_type}")
+        if action_type == 'translate':
+            self.show_preview_image(pixmap, screen_rect=rect, auto_translate=True)
+        elif action_type == 'pin':
+            self.show_preview_image(pixmap, screen_rect=rect, auto_translate=False)
+        elif action_type == 'copy':
+            QApplication.clipboard().setPixmap(pixmap)
+
+    def start_clipboard_pin(self):
+        """触发贴图 (F3)"""
+        logger.info("Triggered clipboard pin")
+        clipboard = QApplication.clipboard()
+        qimg = clipboard.image()
+        if not qimg.isNull():
+            self.show_preview_image(qimg, screen_rect=None, auto_translate=self.auto_translate)
+        else:
+            QMessageBox.information(
+                self, '提示', 
+                '剪贴板中当前没有图片！\n请先使用截屏 (F1) 或复制图片。'
+            )
+
+    def on_clipboard_changed(self):
+        """剪贴板内容变化时自动检测图像并贴图翻译 (仅在设置中明确开启时生效)"""
+        if not getattr(self, 'clipboard_monitor_enabled', False):
+            return
+        if getattr(self, '_is_internal_copy', False):
+            return
+
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime and mime.hasImage():
+            qimg = clipboard.image()
+            if not qimg.isNull() and qimg.width() > 10 and qimg.height() > 10:
+                curr_hash = (
+                    qimg.width(), qimg.height(), 
+                    qimg.pixelColor(0, 0).rgba(), 
+                    qimg.pixelColor(qimg.width()//2, qimg.height()//2).rgba()
+                )
+                if curr_hash == getattr(self, '_last_clipboard_hash', None):
+                    return
+                self._last_clipboard_hash = curr_hash
+                logger.info(f"Clipboard image auto-detected: {qimg.width()}x{qimg.height()}")
+                self.show_preview_image(qimg, screen_rect=None, auto_translate=self.auto_translate)
+
+    def show_preview_image(self, image_data, screen_rect=None, ocr_result=None, auto_translate=None):
+        """显示置顶贴图并执行自动/手动翻译"""
+        if not self.preview_enabled:
+            return
+
+        should_translate = self.auto_translate if auto_translate is None else auto_translate
+
+        win = PreviewWindow(
+            parent=self,
+            image_data=image_data,
+            ocr_result=ocr_result,
+            screen_rect=screen_rect,
+            ocr_processor=self.get_ocr_processor(),
+            auto_translate=should_translate
+        )
+        self.pinned_windows.append(win)
+        win.destroyed.connect(lambda: self.pinned_windows.remove(win) if win in self.pinned_windows else None)
+        win.show()
+        self.preview_window = win
+
+    def show_preview(self, image_path, result):
+        """文件夹监控新增截图触发的回调"""
+        self.show_preview_image(image_path, screen_rect=None, ocr_result=result)
+
+    def show_ocr_error(self, error_msg):
+        logger.warning(f"OCR Error notice: {error_msg}")
+        if hasattr(self, 'trayIcon') and self.trayIcon and self.isHidden():
+            self.trayIcon.showMessage(
+                "提示", str(error_msg),
+                QSystemTrayIcon.MessageIcon.Warning, 3000
+            )
+        else:
+            QMessageBox.warning(self, "OCR 提示", str(error_msg))
 
     def initStyle(self):
         if self.is_dark_mode:
-            # 暗色模式样式
             dark_stylesheet = """
                 QWidget#MainWindow {
                     background-color: #1e1e1e;
@@ -168,6 +323,11 @@ class MainWindow(QMainWindow):
                     border: 1px solid #3a3a3a;
                     border-radius: 4px;
                 }
+                QFrame#actionFrame {
+                    background-color: #252526;
+                    border: 1px solid #007d5e;
+                    border-radius: 6px;
+                }
                 QLabel {
                     background: transparent;
                     border: none;
@@ -176,71 +336,54 @@ class MainWindow(QMainWindow):
                 }
                 #titleLabel {
                     color: #ffffff;
-                    font-size: 20px;
+                    font-size: 18px;
                     font-weight: bold;
-                    padding: 5px;
+                    padding: 2px;
                 }
-                #authorLabel {
+                #authorLabel, #descLabel {
                     color: #b0b0b0;
-                    font-size: 12px;
-                }
-                #descLabel {
-                    color: #b0b0b0;
-                    font-size: 12px;
-                    padding: 5px;
-                    line-height: 1.3;
-                }
-                #githubLink {
-                    color: #5f85f0;
-                    font-size: 12px;
-                }
-                #starLabel {
-                    color: #ff8080;
-                    font-size: 12px;
+                    font-size: 11px;
                 }
                 QPushButton {
                     background-color: #2d5af7;
                     color: white;
                     border: none;
-                    padding: 5px 10px;
+                    padding: 6px 12px;
                     border-radius: 4px;
                     min-width: 60px;
                 }
                 QPushButton:hover {
                     background-color: #1e4aef;
                 }
-                QPushButton:pressed {
-                    background-color: #1a42d8;
+                QPushButton#snipActionButton {
+                    background-color: #00a67d;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 12px;
+                }
+                QPushButton#snipActionButton:hover {
+                    background-color: #008f6c;
+                }
+                QPushButton#clipActionButton {
+                    background-color: #34495e;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 12px;
+                }
+                QPushButton#clipActionButton:hover {
+                    background-color: #2c3e50;
                 }
                 QPushButton#previewButton {
                     background-color: #00a67d;
                 }
-                QPushButton#previewButton:hover {
-                    background-color: #008f6c;
-                }
-                QPushButton#previewButton:pressed {
-                    background-color: #007d5e;
-                }
                 QPushButton#previewButton[preview_off="true"] {
                     background-color: #666666;
-                }
-                QPushButton#previewButton[preview_off="true"]:hover {
-                    background-color: #555555;
                 }
                 QPushButton#autostartButton {
                     background-color: #00a67d;
                 }
-                QPushButton#autostartButton:hover {
-                    background-color: #008f6c;
-                }
-                QPushButton#autostartButton:pressed {
-                    background-color: #007d5e;
-                }
                 QPushButton#autostartButton[autostart_off="true"] {
                     background-color: #666666;
-                }
-                QPushButton#autostartButton[autostart_off="true"]:hover {
-                    background-color: #555555;
                 }
                 QLineEdit {
                     padding: 5px;
@@ -248,158 +391,13 @@ class MainWindow(QMainWindow):
                     border-radius: 4px;
                     background-color: #3a3a3a;
                     color: #e0e0e0;
-                    selection-background-color: #2d5af7;
                 }
-                QLineEdit:focus {
-                    border: 1px solid #2d5af7;
-                    background-color: #454545;
-                    color: #ffffff;
-                }
-                QLineEdit:disabled {
-                    background-color: #383838;
-                    color: #a0a0a0;
-                }
-                QMenu {
-                    background-color: #2d2d2d;
-                    border: 1px solid #3a3a3a;
-                    padding: 5px;
-                }
-                QMenu::item {
-                    padding: 5px 25px 5px 20px;
-                    border-radius: 3px;
+                QCheckBox {
                     color: #e0e0e0;
-                }
-                QMenu::item:selected {
-                    background-color: #3a3a3a;
-                    color: #5f85f0;
-                }
-                QMenuBar {
-                    background-color: #2d2d2d;
-                    color: #e0e0e0;
-                }
-                QMenuBar::item {
-                    background-color: transparent;
-                    padding: 4px 10px;
-                }
-                QMenuBar::item:selected {
-                    background-color: #3a3a3a;
-                    color: #5f85f0;
-                }
-                QComboBox {
-                    background-color: #3a3a3a;
-                    color: #e0e0e0;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 4px;
-                    padding: 5px;
-                }
-                QComboBox::drop-down {
-                    subcontrol-origin: padding;
-                    subcontrol-position: top right;
-                    width: 15px;
-                    border-left-width: 1px;
-                    border-left-color: #3a3a3a;
-                    border-left-style: solid;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: #2d2d2d;
-                    color: #e0e0e0;
-                    selection-background-color: #3a3a3a;
-                    selection-color: #5f85f0;
-                }
-
-                /* Style for QMessageBox */
-                QMessageBox {
-                    background-color: #2d2d2d;
-                }
-                QMessageBox QLabel {
-                    color: #e0e0e0;
-                    background-color: transparent; /* Ensure label background is transparent */
-                }
-                QMessageBox QPushButton {
-                    background-color: #3a3a3a;
-                    color: #e0e0e0;
-                    border: 1px solid #555555;
-                    padding: 5px 15px;
-                    border-radius: 4px;
-                    min-width: 60px;
-                }
-                QMessageBox QPushButton:hover {
-                    background-color: #4a4a4a;
-                    border: 1px solid #777777;
-                }
-                QMessageBox QPushButton:pressed {
-                    background-color: #5a5a5a;
-                }
-
-                /* Style for QDialog */
-                QDialog {
-                    background-color: #2d2d2d;
-                    color: #e0e0e0;
-                }
-                QDialog QLabel {
-                    color: #e0e0e0;
-                    background-color: transparent;
-                }
-                QDialog QLineEdit {
-                    padding: 5px;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 4px;
-                    background-color: #3a3a3a;
-                    color: #e0e0e0;
-                    selection-background-color: #2d5af7;
-                }
-                QDialog QLineEdit:focus {
-                    border: 1px solid #2d5af7;
-                    background-color: #454545;
-                    color: #ffffff;
-                }
-                QDialog QComboBox {
-                    background-color: #3a3a3a;
-                    color: #e0e0e0;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 4px;
-                    padding: 5px;
-                    min-width: 6em;
-                }
-                QDialog QComboBox:hover {
-                    border: 1px solid #2d5af7;
-                }
-                QDialog QComboBox::drop-down {
-                    border: none;
-                    width: 20px;
-                }
-                QDialog QComboBox::down-arrow {
-                    width: 12px;
-                    height: 12px;
-                }
-                QDialog QComboBox QAbstractItemView {
-                    background-color: #2d2d2d;
-                    color: #e0e0e0;
-                    selection-background-color: #3a3a3a;
-                    selection-color: #5f85f0;
-                    border: 1px solid #3a3a3a;
-                }
-                QDialog QPushButton {
-                    background-color: #2d5af7;
-                    color: white;
-                    border: none;
-                    padding: 5px 15px;
-                    border-radius: 4px;
-                    min-width: 60px;
-                }
-                QDialog QPushButton:hover {
-                    background-color: #1e4aef;
-                }
-                QDialog QPushButton:pressed {
-                    background-color: #1a42d8;
-                }
-                QDialogButtonBox {
-                    background-color: transparent;
                 }
             """
             self.setStyleSheet(dark_stylesheet)
         else:
-            # 亮色模式样式（原始样式）
             light_stylesheet = """
                 QWidget#MainWindow {
                     background-color: #f5f5f5;
@@ -409,6 +407,11 @@ class MainWindow(QMainWindow):
                     border: 1px solid #e0e0e0;
                     border-radius: 4px;
                 }
+                QFrame#actionFrame {
+                    background-color: #f0fdf4;
+                    border: 1px solid #00a67d;
+                    border-radius: 6px;
+                }
                 QLabel {
                     background: transparent;
                     border: none;
@@ -417,171 +420,130 @@ class MainWindow(QMainWindow):
                 }
                 #titleLabel {
                     color: #1a1a1a;
-                    font-size: 20px;
+                    font-size: 18px;
                     font-weight: bold;
-                    padding: 5px;
+                    padding: 2px;
                 }
-                #authorLabel {
+                #authorLabel, #descLabel {
                     color: #666666;
-                    font-size: 12px;
-                }
-                #descLabel {
-                    color: #666666;
-                    font-size: 12px;
-                    padding: 5px;
-                    line-height: 1.3;
-                }
-                #githubLink {
-                    color: #2d5af7;
-                    font-size: 12px;
-                }
-                #starLabel {
-                    color: #ff6b6b;
-                    font-size: 12px;
+                    font-size: 11px;
                 }
                 QPushButton {
                     background-color: #2d5af7;
                     color: white;
                     border: none;
-                    padding: 5px 10px;
+                    padding: 6px 12px;
                     border-radius: 4px;
                     min-width: 60px;
                 }
                 QPushButton:hover {
                     background-color: #1e4aef;
                 }
-                QPushButton:pressed {
-                    background-color: #1a42d8;
-                }
-                QPushButton#previewButton {
+                QPushButton#snipActionButton {
                     background-color: #00a67d;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 12px;
                 }
-                QPushButton#previewButton:hover {
+                QPushButton#snipActionButton:hover {
                     background-color: #008f6c;
                 }
-                QPushButton#previewButton:pressed {
-                    background-color: #007d5e;
+                QPushButton#clipActionButton {
+                    background-color: #4a5568;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 12px;
                 }
-                QPushButton#previewButton[preview_off="true"] {
-                    background-color: #666666;
-                }
-                QPushButton#previewButton[preview_off="true"]:hover {
-                    background-color: #555555;
-                }
-                QPushButton#autostartButton {
-                    background-color: #00a67d;
-                }
-                QPushButton#autostartButton:hover {
-                    background-color: #008f6c;
-                }
-                QPushButton#autostartButton:pressed {
-                    background-color: #007d5e;
-                }
-                QPushButton#autostartButton[autostart_off="true"] {
-                    background-color: #666666;
-                }
-                QPushButton#autostartButton[autostart_off="true"]:hover {
-                    background-color: #555555;
+                QPushButton#clipActionButton:hover {
+                    background-color: #2d3748;
                 }
                 QLineEdit {
                     padding: 5px;
-                    border: 1px solid #e0e0e0;
+                    border: 1px solid #dcdcdc;
                     border-radius: 4px;
-                    background-color: #f5f5f5;
-                    color: #666666;
-                    selection-background-color: #2d5af7;
-                }
-                QLineEdit:focus {
-                    border: 1px solid #2d5af7;
-                    background-color: white;
+                    background-color: #ffffff;
                     color: #333333;
                 }
-                QLineEdit:disabled {
-                    background-color: #f5f5f5;
-                    color: #666666;
-                }
-                QMenu {
-                    background-color: white;
-                    border: 1px solid #e0e0e0;
-                    padding: 5px;
-                }
-                QMenu::item {
-                    padding: 5px 25px 5px 20px;
-                    border-radius: 3px;
-                }
-                QMenu::item:selected {
-                    background-color: #f0f2f5;
-                    color: #2d5af7;
+                QCheckBox {
+                    color: #333333;
                 }
             """
             self.setStyleSheet(light_stylesheet)
 
     def initLayout(self):
-        # 主布局
         mainLayout = QVBoxLayout(self.central_widget)
         mainLayout.setContentsMargins(10, 10, 10, 10)
-        mainLayout.setSpacing(10)
+        mainLayout.setSpacing(8)
         
-        # 标题部分
+        # 1. 顶部标题部分
         headerFrame = QFrame(self.central_widget)
         headerLayout = QVBoxLayout(headerFrame)
-        headerLayout.setContentsMargins(10, 10, 10, 10)
-        headerLayout.setSpacing(5)
+        headerLayout.setContentsMargins(10, 8, 10, 8)
+        headerLayout.setSpacing(4)
         
-        # Logo和标题行
         titleLayout = QHBoxLayout()
         logoLabel = QLabel()
-        logoLabel.setPixmap(QIcon(get_resource_path('assets/icon.png')).pixmap(32, 32))
-        titleLabel = QLabel("基于Snipaste的OCR工具")
+        logoLabel.setPixmap(QIcon(get_resource_path('assets/icon.png')).pixmap(28, 28))
+        titleLabel = QLabel("SnipasteOCR 贴图自动翻译")
         titleLabel.setObjectName("titleLabel")
         titleLayout.addWidget(logoLabel)
         titleLayout.addWidget(titleLabel)
         titleLayout.addStretch()
         
-        # 作者和GitHub链接行
         infoLayout = QHBoxLayout()
-        authorLabel = QLabel("作者: formero009")
+        authorLabel = QLabel("作者: formero009 | 支持免存盘原地定屏翻译")
         authorLabel.setObjectName("authorLabel")
-        githubLabel = QLabel("<a href='https://github.com/formero009/SnipasteOCR' style='color: #2d5af7;'>GitHub</a>")
-        githubLabel.setOpenExternalLinks(True)
-        githubLabel.setObjectName("githubLink")
-        starLabel = QLabel("⭐ 如果觉得有用，欢迎点个Star支持一下~")
-        starLabel.setObjectName("starLabel")
         infoLayout.addWidget(authorLabel)
-        infoLayout.addWidget(githubLabel)
-        infoLayout.addWidget(starLabel)
         infoLayout.addStretch()
-        
-        # 说明文字
-        descLabel = QLabel("这是一个基于Snipaste的OCR工具，可以自动识别截图中的文字。使用Snipaste截图后，程序会自动进行文字识别并复制到剪贴板。")
-        descLabel.setObjectName("descLabel")
-        descLabel.setWordWrap(True)
         
         headerLayout.addLayout(titleLayout)
         headerLayout.addLayout(infoLayout)
-        headerLayout.addWidget(descLabel)
-        
         mainLayout.addWidget(headerFrame)
         
-        # 路径设置布局
+        # 2. 核心功能快捷操作卡片
+        actionFrame = QFrame(self.central_widget)
+        actionFrame.setObjectName("actionFrame")
+        actionLayout = QVBoxLayout(actionFrame)
+        actionLayout.setContentsMargins(12, 10, 12, 10)
+        actionLayout.setSpacing(6)
+        
+        btnLayout = QHBoxLayout()
+        self.btn_snip = QPushButton(f"✂️ 截屏 ({self.hotkeys.get('snip', 'F1')})")
+        self.btn_snip.setObjectName("snipActionButton")
+        self.btn_snip.clicked.connect(self.start_standard_snip)
+        btnLayout.addWidget(self.btn_snip)
+
+        self.btn_fast = QPushButton(f"⚡ 一键翻译 ({self.hotkeys.get('snip_and_pin', 'F4')})")
+        self.btn_fast.setObjectName("fastActionButton")
+        self.btn_fast.clicked.connect(self.start_fast_snip_and_pin)
+        btnLayout.addWidget(self.btn_fast)
+        
+        self.btn_clip = QPushButton(f"📌 贴图 ({self.hotkeys.get('clipboard_pin', 'F3')})")
+        self.btn_clip.setObjectName("clipActionButton")
+        self.btn_clip.clicked.connect(self.start_clipboard_pin)
+        btnLayout.addWidget(self.btn_clip)
+
+        # 模式切换行：手动翻译 vs 自动翻译
+        modeLayout = QHBoxLayout()
+        self.auto_trans_btn = QPushButton("截图模式：手动翻译 (贴出原图，按空格/T翻译)")
+        self.auto_trans_btn.setStyleSheet("background-color: #2c3e50; color: white; border-radius: 4px; padding: 4px 8px; font-size: 12px;")
+        self.auto_trans_btn.clicked.connect(self.toggle_auto_translate)
+        modeLayout.addWidget(self.auto_trans_btn)
+        
+        tipLabel = QLabel("💡 零后台监控消耗：按 F1 调出 Snipaste 交互工具栏；按 F4 极速框选并覆盖翻译；贴图支持按【空格/T】切换原文/译文，滚轮调透明度，双击关闭。")
+        tipLabel.setWordWrap(True)
+        tipLabel.setStyleSheet("font-size: 11px; opacity: 0.85; padding-top: 2px;")
+        
+        actionLayout.addLayout(btnLayout)
+        actionLayout.addLayout(modeLayout)
+        actionLayout.addWidget(tipLabel)
+        mainLayout.addWidget(actionFrame)
+        
+        # 3. 基础配置卡片（路径与选项）
         pathFrame = QFrame(self.central_widget)
         pathLayout = QVBoxLayout(pathFrame)
-        pathLayout.setContentsMargins(10, 10, 10, 10)
-        pathLayout.setSpacing(10)
-        
-        # Snipaste路径
-        snipaste_layout = QHBoxLayout()
-        snipaste_layout.setSpacing(5)
-        snipaste_label = QLabel('截图保存路径:')
-        self.snipaste_path = QLineEdit()
-        self.snipaste_path.setReadOnly(True)
-        self.snipaste_path.setToolTip(self.snipaste_path.text())
-        snipaste_button = QPushButton('浏览')
-        snipaste_button.setFixedWidth(60)
-        snipaste_button.clicked.connect(lambda: self.browse_folder(self.snipaste_path))
-        snipaste_layout.addWidget(snipaste_label)
-        snipaste_layout.addWidget(self.snipaste_path)
-        snipaste_layout.addWidget(snipaste_button)
+        pathLayout.setContentsMargins(10, 8, 10, 8)
+        pathLayout.setSpacing(6)
         
         # 模型路径
         model_layout = QHBoxLayout()
@@ -589,91 +551,87 @@ class MainWindow(QMainWindow):
         model_label = QLabel('模型路径:')
         self.model_path = QLineEdit()
         self.model_path.setReadOnly(True)
-        self.model_path.setToolTip(self.model_path.text())
         model_button = QPushButton('浏览')
-        model_button.setFixedWidth(60)
+        model_button.setFixedWidth(55)
         model_button.clicked.connect(lambda: self.browse_folder(self.model_path))
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.model_path)
         model_layout.addWidget(model_button)
-        
-        pathLayout.addLayout(snipaste_layout)
         pathLayout.addLayout(model_layout)
         
         # 按钮布局
         buttonLayout = QHBoxLayout()
         
-        # 预览开关按钮
-        self.preview_button = QPushButton('预览窗口：开启')
+        self.preview_button = QPushButton('贴图置顶：开启')
         self.preview_button.setObjectName("previewButton")
         self.preview_button.clicked.connect(self.toggle_preview)
-        self.preview_button.setProperty("preview_off", not self.preview_enabled)
         buttonLayout.addWidget(self.preview_button)
         
-        # 自启动开关按钮
         self.autostart_button = QPushButton('开机自启：关闭')
         self.autostart_button.setObjectName("autostartButton")
         self.autostart_button.clicked.connect(self.toggle_autostart)
         buttonLayout.addWidget(self.autostart_button)
         
+        self.settings_btn = QPushButton('首选项与热键')
+        self.settings_btn.clicked.connect(self.show_translation_settings)
+        buttonLayout.addWidget(self.settings_btn)
+        
         buttonLayout.addStretch()
         
-        # 保存按钮
         save_button = QPushButton('保存设置')
         save_button.clicked.connect(self.saveConfig)
         buttonLayout.addWidget(save_button)
         
         pathLayout.addLayout(buttonLayout)
         mainLayout.addWidget(pathFrame)
-        self.central_widget.setLayout(mainLayout)
         
-        # 加载配置
-        self.loadConfig()
+        self.central_widget.setLayout(mainLayout)
 
     def closeEvent(self, event):
-        if self.preview_window is not None:
-            self.preview_window.close()
-            self.preview_window = None
         event.ignore()
         self.hide()
 
     def quit(self):
         try:
             logger.info("Quitting application")
-            if self.preview_window is not None:
-                self.preview_window.close()
-                self.preview_window = None
+            for win in list(self.pinned_windows):
+                try:
+                    win.close()
+                except Exception:
+                    pass
+            self.pinned_windows.clear()
+
+            # 取消所有可能还在运行的后台工作线程
+            for worker in list(getattr(self, 'active_workers', [])):
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+            self.active_workers.clear()
+
+            if self.hotkey_thread is not None and self.hotkey_thread.isRunning():
+                self.hotkey_thread.stop()
+                self.hotkey_thread = None
 
             if self.ocrThread is not None and self.ocrThread.isRunning():
                 self.ocrThread.stop()
                 self.ocrThread.quit()
                 if not self.ocrThread.wait(1000):
-                    logger.warning("OCR thread did not exit in time, forcing termination")
                     self.ocrThread.terminate()
                     self.ocrThread.wait()
                 self.ocrThread = None
             
             QApplication.quit()
         except Exception as e:
-            logger.error(f"Error during quit: {str(e)}")
+            logger.error(f"Error during quit: {e}")
             QApplication.quit()
 
-    def editConfig(self):
-        dialog = SettingsDialog(self)
-        dialog.exec()
-
     def iconActivated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick and self.isHidden():
-            self.showNormal()
-        elif reason == QSystemTrayIcon.ActivationReason.DoubleClick and not self.isHidden():
-            self.hide()
-
-    def show_preview(self, image_path, result):
-        if self.preview_enabled:  # 只在开启预览时显示窗口
-            if self.preview_window is not None:
-                self.preview_window.close()
-            self.preview_window = PreviewWindow(self, image_path, result)
-            self.preview_window.show()
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            if self.isHidden():
+                self.showNormal()
+            else:
+                self.hide()
 
     def toggleWindow(self):
         if self.isHidden():
@@ -685,49 +643,25 @@ class MainWindow(QMainWindow):
 
     def showAbout(self):
         QMessageBox.about(self, f"关于 {APP_NAME}",
-                         f"""<h3>{APP_NAME} v1.0</h3>
-                         <p>一个基于 PaddleOCR 的截图文字识别工具</p>
-                         <p>作者: formero009</p>
-                         <p>邮箱: wangchen2588@gmail.com</p>
+                         f"""<h3>{APP_NAME}</h3>
+                         <p>支持 Snipaste 贴图与屏幕原地定屏翻译的 OCR 工具</p>
+                         <p>开箱即用免配置翻译 | 飞桨 FastDeploy OCR 高速模型</p>
                          <p>项目主页: <a href='https://github.com/formero009/SnipasteOCR'>GitHub</a></p>""")
 
     def showUsage(self):
+        snip_k = self.hotkeys.get('snip_and_pin', 'F4')
+        clip_k = self.hotkeys.get('clipboard_pin', 'Alt+W')
         QMessageBox.information(self, "使用说明",
-                              """<h3>使用步骤：</h3>
-                              <p>1. 使用 Snipaste 进行截图</p>
-                              <p>2. 程序会自动识别截图中的文字</p>
-                              <p>3. 识别结果会自动复制到剪贴板</p>
-                              <p>4. 同时会显示识别预览窗口</p>
-                              <h3>快捷操作：</h3>
-                              <p>- 双击托盘图标：显示/隐藏主窗口</p>
-                              <p>- ESC键：关闭预览窗口</p>""")
-
-    def setupSettings(self):
-        # Snipaste path setting
-        snipaste_layout = QHBoxLayout()
-        snipaste_label = QLabel('截图保存路径:')
-        self.snipaste_path = QLineEdit()
-        snipaste_button = QPushButton('浏览')
-        snipaste_button.clicked.connect(lambda: self.browse_folder(self.snipaste_path))
-        snipaste_layout.addWidget(snipaste_label)
-        snipaste_layout.addWidget(self.snipaste_path)
-        snipaste_layout.addWidget(snipaste_button)
-
-        # Model path setting
-        model_layout = QHBoxLayout()
-        model_label = QLabel('模型路径:')
-        self.model_path = QLineEdit()
-        model_button = QPushButton('浏览')
-        model_button.clicked.connect(lambda: self.browse_folder(self.model_path))
-        model_layout.addWidget(model_label)
-        model_layout.addWidget(self.model_path)
-        model_layout.addWidget(model_button)
-
-        # Add settings to main layout
-        self.layout().addLayout(snipaste_layout)
-        self.layout().addLayout(model_layout)
-
-        self.loadConfig()
+                              f"""<h3>快捷使用指南：</h3>
+                              <p><b>1. 原地定屏翻译（推荐）：</b><br>
+                              按快捷键 <b>{snip_k}</b>，框选屏幕上想要翻译的区域（包括 Snipaste 贴图），松开鼠标即可原地生成贴图，自动覆盖翻译！</p>
+                              <p><b>2. 剪贴板贴图翻译：</b><br>
+                              使用 Snipaste 等截取并复制图片后，按 <b>{clip_k}</b> 即可直接贴在鼠标位置并自动翻译。</p>
+                              <p><b>3. 贴图窗口操作：</b><br>
+                              - <b>鼠标拖动</b>：任意拖拽贴图位置<br>
+                              - <b>滚轮滑动</b>：调整贴图透明度<br>
+                              - <b>空格键</b>：快速切换原文/译文<br>
+                              - <b>双击或 ESC</b>：关闭贴图</p>""")
 
     def browse_folder(self, line_edit):
         start_dir = line_edit.text() if os.path.isdir(line_edit.text()) else str(pathlib.Path.home())
@@ -741,76 +675,114 @@ class MainWindow(QMainWindow):
             current_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
             config_path = os.path.join(current_path, 'config.yml')
             
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-                if hasattr(self, 'snipaste_path'):
-                    self.snipaste_path.setText(config['snipaste'].get('path', ''))
-                    self.snipaste_path.setToolTip(self.snipaste_path.text())
-                if hasattr(self, 'model_path'):
-                    default_model_path = os.path.join(current_path, 'models')
-                    modelpath_text = config['snipaste'].get('modelpath', default_model_path)
-                    self.model_path.setText(modelpath_text)
-                    self.model_path.setToolTip(modelpath_text)
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f) or {}
+            else:
+                config = {}
 
-                snipaste_config = config.get('snipaste', {})
-                self.preview_enabled = snipaste_config.get('preview_enabled', True)
+            snipaste_config = config.get('snipaste') or {}
+            default_model_path = os.path.join(current_path, 'models')
+            modelpath_text = snipaste_config.get('modelpath') or default_model_path
+            self.model_path.setText(modelpath_text)
+            self.model_path.setToolTip(modelpath_text)
 
-                if hasattr(self, 'preview_button'):
-                    self.preview_button.setText(f'预览窗口：{"开启" if self.preview_enabled else "关闭"}')
-                    self.preview_button.setProperty("preview_off", not self.preview_enabled)
-                    self.preview_button.style().unpolish(self.preview_button)
-                    self.preview_button.style().polish(self.preview_button)
-                    
-                if hasattr(self, 'autostart_button'):
-                    self.update_autostart_button()
-                
-                if 'translation' in config:
-                    self.translation_settings.update({
-                        'secret_id': config['translation'].get('secret_id', ''),
-                        'secret_key': config['translation'].get('secret_key', ''),
-                        'from_lang': config['translation'].get('from_lang', 'auto'),
-                        'to_lang': config['translation'].get('to_lang', 'zh')
-                    })
-        except FileNotFoundError:
-            logger.warning(f"Configuration file not found at {config_path}. Using defaults.")
-            if hasattr(self, 'snipaste_path'):
-                self.snipaste_path.setText('')
-                self.snipaste_path.setToolTip('')
-            if hasattr(self, 'model_path'):
-                 default_model_path = os.path.join(current_path, 'models')
-                 self.model_path.setText(default_model_path)
-                 self.model_path.setToolTip(default_model_path)
-            self.preview_enabled = True
+            self.auto_translate = snipaste_config.get('auto_translate', False)
+            self.preview_enabled = snipaste_config.get('preview_enabled', True)
+            self.monitor_folder_enabled = snipaste_config.get('monitor_folder_enabled', False)
+            self.clipboard_monitor_enabled = snipaste_config.get('clipboard_monitor_enabled', False)
+
+            if hasattr(self, 'auto_trans_btn'):
+                self.update_auto_trans_btn_text()
+
             if hasattr(self, 'preview_button'):
-                 self.preview_button.setText('预览窗口：开启')
-                 self.preview_button.setProperty("preview_off", False)
-                 self.preview_button.style().unpolish(self.preview_button)
-                 self.preview_button.style().polish(self.preview_button)
+                self.preview_button.setText(f'贴图置顶：{"开启" if self.preview_enabled else "关闭"}')
+                self.preview_button.setProperty("preview_off", not self.preview_enabled)
+                self.preview_button.style().unpolish(self.preview_button)
+                self.preview_button.style().polish(self.preview_button)
+                
             if hasattr(self, 'autostart_button'):
-                 self.update_autostart_button()
+                self.update_autostart_button()
+            
+            if 'hotkeys' in config:
+                self.hotkeys.update({
+                    'snip': config['hotkeys'].get('snip', 'F1'),
+                    'snip_and_pin': config['hotkeys'].get('snip_and_pin', 'F4'),
+                    'clipboard_pin': config['hotkeys'].get('clipboard_pin', 'F3')
+                })
+
+            if 'translation' in config:
+                self.translation_settings.update({
+                    'provider': config['translation'].get('provider', 'free'),
+                    'secret_id': config['translation'].get('secret_id', ''),
+                    'secret_key': config['translation'].get('secret_key', ''),
+                    'from_lang': config['translation'].get('from_lang', 'auto'),
+                    'to_lang': config['translation'].get('to_lang', 'zh')
+                })
+
+            self.update_hotkey_labels()
         except Exception as e:
-            logger.error(f"Failed to load configuration: {str(e)}")
-            QMessageBox.warning(self, '错误', f'加载配置文件失败: {str(e)}')
+            logger.error(f"Failed to load configuration: {e}")
+
+    def update_auto_trans_btn_text(self):
+        if not hasattr(self, 'auto_trans_btn'):
+            return
+        if self.auto_translate:
+            self.auto_trans_btn.setText("截图模式：自动翻译 (框选后立即识别覆盖)")
+            self.auto_trans_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;")
+        else:
+            self.auto_trans_btn.setText("截图模式：手动翻译 (贴出原图，按空格/T翻译)")
+            self.auto_trans_btn.setStyleSheet("background-color: #2c3e50; color: white; border-radius: 4px; padding: 4px 8px; font-size: 12px;")
+
+    def toggle_auto_translate(self):
+        self.auto_translate = not self.auto_translate
+        self.update_auto_trans_btn_text()
+        self.saveConfig()
+
+    def update_hotkey_labels(self):
+        """更新界面上快捷键的显示文案"""
+        snip_k = self.hotkeys.get('snip', 'F1')
+        fast_k = self.hotkeys.get('snip_and_pin', 'F4')
+        clip_k = self.hotkeys.get('clipboard_pin', 'F3')
+        if hasattr(self, 'btn_snip'):
+            self.btn_snip.setText(f"✂️ 截屏 ({snip_k})")
+        if hasattr(self, 'btn_fast'):
+            self.btn_fast.setText(f"⚡ 一键翻译 ({fast_k})")
+        if hasattr(self, 'btn_clip'):
+            self.btn_clip.setText(f"📌 贴图 ({clip_k})")
+        if hasattr(self, 'traySnipAction'):
+            self.traySnipAction.setText(f"✂️ 截屏 ({snip_k})")
+        if hasattr(self, 'trayFastAction'):
+            self.trayFastAction.setText(f"⚡ 极速截屏翻译 ({fast_k})")
+        if hasattr(self, 'trayClipAction'):
+            self.trayClipAction.setText(f"📌 贴图 ({clip_k})")
 
     def saveConfig(self):
         try:
             current_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
             config_path = os.path.join(current_path, 'config.yml')
             
-            # 读取现有配置（如果存在）
             existing_config = {}
             if os.path.exists(config_path):
                 with open(config_path, 'r', encoding='utf-8') as f:
                     existing_config = yaml.safe_load(f) or {}
             
-            # 更新配置
             config = {
+                'hotkeys': {
+                    'snip': self.hotkeys.get('snip', 'F1'),
+                    'snip_and_pin': self.hotkeys.get('snip_and_pin', 'F4'),
+                    'clipboard_pin': self.hotkeys.get('clipboard_pin', 'F3')
+                },
                 'snipaste': {
-                    'path': self.snipaste_path.text(),
+                    'path': os.path.join(current_path, 'screenshots'),
                     'modelpath': self.model_path.text(),
-                    'preview_enabled': self.preview_enabled
+                    'auto_translate': self.auto_translate,
+                    'preview_enabled': self.preview_enabled,
+                    'monitor_folder_enabled': self.monitor_folder_enabled,
+                    'clipboard_monitor_enabled': getattr(self, 'clipboard_monitor_enabled', False)
                 },
                 'translation': {
+                    'provider': self.translation_settings.get('provider', 'free'),
                     'secret_id': self.translation_settings.get('secret_id', ''),
                     'secret_key': self.translation_settings.get('secret_key', ''),
                     'from_lang': self.translation_settings.get('from_lang', 'auto'),
@@ -818,132 +790,135 @@ class MainWindow(QMainWindow):
                 }
             }
             
-            # 合并配置
             existing_config.update(config)
             
-            # 保存配置
             with open(config_path, 'w', encoding='utf-8') as f:
                 yaml.dump(existing_config, f, allow_unicode=True)
 
-            # 重新启动OCR线程
-            if self.ocrThread is not None:
-                self.ocrThread.stop()
-                self.ocrThread.quit()
-                if not self.ocrThread.wait(1000):
-                    logger.warning("OCR thread did not exit in time, forcing termination")
-                    self.ocrThread.terminate()
-                    self.ocrThread.wait()
-            
-            # 创建新的OCR线程
-            self.ocrThread = OCRThread()
-            self.ocrThread.preview_signal.connect(self.show_preview)
-            self.ocrThread.error_signal.connect(self.show_ocr_error)
-            self.ocrThread.start()
+            self.update_hotkey_labels()
+            self.initHotkeys()
 
-            QMessageBox.information(self, '成功', '设置已保存并重新加载OCR服务')
-            
-            # 重新启用预览按钮（如果之前被禁用）
-            self.preview_button.setEnabled(True)
-            self.preview_button.setToolTip('')
-            
+            QMessageBox.information(self, '成功', '设置已保存！快捷键与翻译服务已更新生效。')
         except Exception as e:
-            logger.error(f"Failed to save configuration: {str(e)}")
-            QMessageBox.warning(self, '错误', f'保存配置文件失败: {str(e)}')
+            logger.error(f"Failed to save configuration: {e}")
+            QMessageBox.warning(self, '错误', f'保存配置文件失败: {e}')
 
     def restart(self):
         try:
             logger.info("Restarting application")
-            if self.preview_window is not None:
-                self.preview_window.close()
-                self.preview_window = None
-
-            if self.ocrThread is not None and self.ocrThread.isRunning():
-                self.ocrThread.stop()
-                self.ocrThread.quit()
-                if not self.ocrThread.wait(1000):
-                    logger.warning("OCR thread did not exit in time during restart, forcing termination")
-                    self.ocrThread.terminate()
-                    self.ocrThread.wait()
-                self.ocrThread = None
-
+            self.quit()
             program = sys.executable
             args = sys.argv
-            logger.info(f"Relaunching: {program} {args}")
-            if platform.system() == "Windows" and ' ' in program:
-                 program = f'"{program}"'
-                 
             import subprocess
-            subprocess.Popen([program] + args) 
-            
-            QApplication.quit()
-            
+            subprocess.Popen([program] + args)
         except Exception as e:
-            logger.error(f"Failed to restart application: {str(e)}")
-            QMessageBox.warning(self, '错误', f'重启程序失败: {str(e)}')
+            logger.error(f"Failed to restart application: {e}")
 
     def toggle_preview(self):
         self.preview_enabled = not self.preview_enabled
-        self.preview_button.setText(f'预览窗口：{"开启" if self.preview_enabled else "关闭"}')
+        self.preview_button.setText(f'贴图置顶：{"开启" if self.preview_enabled else "关闭"}')
         self.preview_button.setProperty("preview_off", not self.preview_enabled)
         self.preview_button.style().unpolish(self.preview_button)
         self.preview_button.style().polish(self.preview_button)
 
     def show_translation_settings(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle('翻译设置')
-        dialog.setMinimumSize(400, 250)  # 设置最小宽度和高度，但允许更大
+        dialog.setWindowTitle('首选项与快捷键设置')
+        dialog.setMinimumSize(420, 320)
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
         
-        # 添加腾讯云翻译API说明文字
-        explanation_label = QLabel('以下设置用于腾讯云机器翻译API，<a href="https://console.cloud.tencent.com/cam/capi">点击此处</a>获取API密钥。')
-        explanation_label.setOpenExternalLinks(True)
-        explanation_label.setWordWrap(True)
-        layout.addRow(explanation_label)
+        # 翻译服务选择
+        provider_combo = QComboBox()
+        provider_combo.addItem("免费翻译 (开箱即用，无需申请 API)", "free")
+        provider_combo.addItem("腾讯云机器翻译 (需填密钥)", "tencent")
+        curr_provider = self.translation_settings.get('provider', 'free')
+        provider_combo.setCurrentIndex(1 if curr_provider == 'tencent' else 0)
+        layout.addRow('翻译服务:', provider_combo)
         
         # SecretId输入
-        secret_id_layout = QHBoxLayout()
-        secret_id_input = QLineEdit(self.translation_settings['secret_id'])
-        secret_id_layout.addWidget(secret_id_input)
-        layout.addRow('SecretId:', secret_id_layout)
+        secret_id_input = QLineEdit(self.translation_settings.get('secret_id', ''))
+        layout.addRow('SecretId (腾讯云):', secret_id_input)
         
         # SecretKey输入
-        secret_key_layout = QHBoxLayout()
-        secret_key_input = QLineEdit(self.translation_settings['secret_key'])
-        secret_key_layout.addWidget(secret_key_input)
-        layout.addRow('SecretKey:', secret_key_layout)
+        secret_key_input = QLineEdit(self.translation_settings.get('secret_key', ''))
+        secret_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addRow('SecretKey (腾讯云):', secret_key_input)
         
-        # 源语言选择
+        def update_secret_fields(idx):
+            is_tencent = (idx == 1)
+            secret_id_input.setEnabled(is_tencent)
+            secret_key_input.setEnabled(is_tencent)
+        provider_combo.currentIndexChanged.connect(update_secret_fields)
+        update_secret_fields(provider_combo.currentIndex())
+        
+        # 源语言
         from_lang_input = QComboBox()
-        from_lang_input.setFixedHeight(30)
         langs = [('auto', '自动检测'), ('zh', '中文'), ('en', '英文'), ('ja', '日文'), ('ko', '韩文')]
         for code, name in langs:
             from_lang_input.addItem(name, code)
-        
-        # 设置当前选中的语言
-        current_from_index = from_lang_input.findData(self.translation_settings['from_lang'])
-        from_lang_input.setCurrentIndex(current_from_index if current_from_index >= 0 else 0)
+        c_from = from_lang_input.findData(self.translation_settings.get('from_lang', 'auto'))
+        from_lang_input.setCurrentIndex(max(0, c_from))
         layout.addRow('源语言:', from_lang_input)
         
-        # 目标语言选择
+        # 目标语言
         to_lang_input = QComboBox()
-        to_lang_input.setFixedHeight(30)
-        target_langs = langs[1:]  # 移除'auto'选项
-        for code, name in target_langs:
+        for code, name in langs[1:]:
             to_lang_input.addItem(name, code)
-            
-        # 设置当前选中的语言
-        current_to_index = to_lang_input.findData(self.translation_settings['to_lang'])
-        to_lang_input.setCurrentIndex(current_to_index if current_to_index >= 0 else 0)
+        c_to = to_lang_input.findData(self.translation_settings.get('to_lang', 'zh'))
+        to_lang_input.setCurrentIndex(max(0, c_to))
         layout.addRow('目标语言:', to_lang_input)
         
-        # 按钮
+        # 快捷键设置 (Snipaste 交互式组合键录制)
+        from src.ui.hotkey_edit import HotkeyEdit
+
+        snip_layout = QHBoxLayout()
+        snip_hotkey_input = HotkeyEdit(self.hotkeys.get('snip', 'F1'))
+        btn_test_snip = QPushButton("▶ 试用截图")
+        btn_test_snip.setToolTip("点击后立即测试截屏功能")
+        btn_test_snip.clicked.connect(lambda: (dialog.hide(), QTimer.singleShot(250, self.start_standard_snip)))
+        snip_layout.addWidget(snip_hotkey_input)
+        snip_layout.addWidget(btn_test_snip)
+        layout.addRow('截屏快捷键 (Snipaste 模式):', snip_layout)
+
+        fast_layout = QHBoxLayout()
+        fast_hotkey_input = HotkeyEdit(self.hotkeys.get('snip_and_pin', 'F4'))
+        btn_test_fast = QPushButton("▶ 试用翻译")
+        btn_test_fast.setToolTip("点击后立即测试极速截屏翻译")
+        btn_test_fast.clicked.connect(lambda: (dialog.hide(), QTimer.singleShot(250, self.start_fast_snip_and_pin)))
+        fast_layout.addWidget(fast_hotkey_input)
+        fast_layout.addWidget(btn_test_fast)
+        layout.addRow('一键极速翻译快捷键:', fast_layout)
+        
+        clip_layout = QHBoxLayout()
+        clip_hotkey_input = HotkeyEdit(self.hotkeys.get('clipboard_pin', 'Alt+W'))
+        btn_test_clip = QPushButton("▶ 试用贴图")
+        btn_test_clip.setToolTip("点击后立即测试贴图功能")
+        btn_test_clip.clicked.connect(lambda: (dialog.hide(), QTimer.singleShot(250, self.start_clipboard_pin)))
+        clip_layout.addWidget(clip_hotkey_input)
+        clip_layout.addWidget(btn_test_clip)
+        layout.addRow('贴图快捷键 (Snipaste F3):', clip_layout)
+
+        # 自动翻译模式开关
+        auto_translate_cb = QCheckBox('截图后自动翻译 (关闭则仅贴出原图，按空格或T手动翻译)')
+        auto_translate_cb.setChecked(self.auto_translate)
+        layout.addRow('', auto_translate_cb)
+
+        # 剪贴板自动贴图开关
+        clip_monitor_cb = QCheckBox('后台自动监听剪贴板 (默认关闭，零内存/零CPU消耗)')
+        clip_monitor_cb.setChecked(self.clipboard_monitor_enabled)
+        layout.addRow('', clip_monitor_cb)
+
+        # 文件夹监控开关
+        folder_monitor_cb = QCheckBox('后台自动监听截图文件夹 (默认关闭，零内存/零CPU消耗)')
+        folder_monitor_cb.setChecked(self.monitor_folder_enabled)
+        layout.addRow('', folder_monitor_cb)
+        
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        # 设置按钮文本为中文
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(dialog.accept)
@@ -951,168 +926,110 @@ class MainWindow(QMainWindow):
         layout.addRow(buttons)
         
         dialog.setLayout(layout)
-        
-        dialog.setWindowFlags(Qt.WindowType.Dialog | 
-                            Qt.WindowType.CustomizeWindowHint |
-                            Qt.WindowType.WindowTitleHint |
-                            Qt.WindowType.WindowCloseButtonHint)
         dialog.setModal(True)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.translation_settings.update({
-                'secret_id': secret_id_input.text(),
-                'secret_key': secret_key_input.text(),
+                'provider': provider_combo.currentData(),
+                'secret_id': secret_id_input.text().strip(),
+                'secret_key': secret_key_input.text().strip(),
                 'from_lang': from_lang_input.currentData(),
                 'to_lang': to_lang_input.currentData()
             })
-            # 保存配置
+            self.hotkeys.update({
+                'snip': snip_hotkey_input.text().strip() or 'F1',
+                'snip_and_pin': fast_hotkey_input.text().strip() or 'F4',
+                'clipboard_pin': clip_hotkey_input.text().strip() or 'F3'
+            })
+            self.auto_translate = auto_translate_cb.isChecked()
+            if hasattr(self, 'auto_trans_btn'):
+                self.update_auto_trans_btn_text()
+            self.clipboard_monitor_enabled = clip_monitor_cb.isChecked()
+            self.monitor_folder_enabled = folder_monitor_cb.isChecked()
             self.saveConfig()
-            
+
     def get_translation_settings(self):
         return self.translation_settings.copy()
 
     def toggle_autostart(self):
-        """切换开机自启动状态 (Cross-platform)"""
         current_os = platform.system()
-        is_enabled = False
-        set_successfully = False
-        
         try:
             if current_os == "Windows":
                 is_enabled = self._is_windows_autostart_enabled()
                 self._set_windows_autostart(not is_enabled)
-                set_successfully = True
+                self.update_autostart_button()
             elif current_os == "Linux":
                 is_enabled = self._is_linux_autostart_enabled()
                 self._set_linux_autostart(not is_enabled)
-                set_successfully = True
-            else:
-                 logger.warning(f"Autostart not supported on this platform: {current_os}")
-                 QMessageBox.warning(self, '不支持', f'此操作系统 ({current_os}) 不支持开机自启动设置。')
-                 return
-
-            if set_successfully:
                 self.update_autostart_button()
-
+            else:
+                QMessageBox.warning(self, '不支持', f'此操作系统 ({current_os}) 不支持自启动设置。')
         except Exception as e:
-            logger.error(f"Failed to toggle autostart on {current_os}: {str(e)}")
-            QMessageBox.warning(self, '错误', f'设置开机自启动失败: {str(e)}')
-            self.update_autostart_button()
+            logger.error(f"Failed to toggle autostart: {e}")
 
     def update_autostart_button(self):
-        """更新自启动按钮状态 (Cross-platform)"""
         current_os = platform.system()
-        is_autostart = False
-        supported = True
-
+        is_enabled = False
         try:
             if current_os == "Windows":
-                is_autostart = self._is_windows_autostart_enabled()
+                is_enabled = self._is_windows_autostart_enabled()
             elif current_os == "Linux":
-                is_autostart = self._is_linux_autostart_enabled()
-            else:
-                logger.info(f"Autostart checking not implemented for {current_os}")
-                supported = False
+                is_enabled = self._is_linux_autostart_enabled()
+        except Exception:
+            pass
 
-            if hasattr(self, 'autostart_button'):
-                 if supported:
-                     self.autostart_button.setText(f'开机自启：{"开启" if is_autostart else "关闭"}')
-                     self.autostart_button.setProperty("autostart_off", not is_autostart)
-                     self.autostart_button.setEnabled(True)
-                 else:
-                     self.autostart_button.setText('开机自启：不支持')
-                     self.autostart_button.setProperty("autostart_off", True)
-                     self.autostart_button.setEnabled(False)
-                 
-                 self.autostart_button.style().unpolish(self.autostart_button)
-                 self.autostart_button.style().polish(self.autostart_button)
-                 
-        except Exception as e:
-             logger.error(f"Failed to update autostart button state on {current_os}: {str(e)}")
-             if hasattr(self, 'autostart_button'):
-                 self.autostart_button.setText('开机自启：错误')
-                 self.autostart_button.setEnabled(False)
-
-    def show_ocr_error(self, error_msg):
-        """显示OCR错误消息"""
-        QMessageBox.warning(self, '错误', error_msg)
-        if hasattr(self, 'preview_button'):
-            self.preview_button.setEnabled(False)
-            self.preview_button.setToolTip('OCR服务未正常启动') 
+        if hasattr(self, 'autostart_button'):
+            self.autostart_button.setText(f'开机自启：{"开启" if is_enabled else "关闭"}')
+            self.autostart_button.setProperty("autostart_off", not is_enabled)
+            self.autostart_button.style().unpolish(self.autostart_button)
+            self.autostart_button.style().polish(self.autostart_button)
 
     def check_dark_mode(self):
-        """检测系统是否处于暗色模式 (Cross-Platform)"""
-        current_os = platform.system()
-        
-        if current_os == "Windows":
-             return self._check_windows_dark_mode()
-        elif current_os == "Linux":
-            try:
-                window_color = self.palette().color(QPalette.ColorRole.Window)
-                text_color = self.palette().color(QPalette.ColorRole.WindowText)
-                is_dark = window_color.lightness() < text_color.lightness() or window_color.lightness() < 100
-                logger.debug(f"Linux dark mode check: Window lightness={window_color.lightness()}, Text lightness={text_color.lightness()}. Detected dark: {is_dark}")
-                return is_dark
-            except Exception as e:
-                logger.error(f"Failed to check Linux dark mode via Qt Palette: {str(e)}")
-                return False
-        else:
-            logger.info(f"Dark mode detection not implemented for OS: {current_os}. Assuming light mode.")
-            return False
+        if platform.system() == "Windows":
+            return self._is_windows_dark_mode()
+        return False
 
-    def _check_windows_dark_mode(self):
-        """检测Windows系统是否处于暗色模式 (Windows Specific)"""
-        import winreg
+    def _is_windows_dark_mode(self):
         try:
-            registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
-            key = winreg.OpenKey(registry, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-            value, regtype = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            )
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
             winreg.CloseKey(key)
-            logger.debug(f"Windows AppsUseLightTheme registry value: {value}")
             return value == 0
-        except FileNotFoundError:
-             logger.warning("Windows dark mode registry key 'AppsUseLightTheme' not found. Assuming light mode.")
-             return False
-        except Exception as e:
-            logger.error(f"Failed to check Windows dark mode via registry: {str(e)}")
+        except Exception:
             return False
 
     def _get_executable_path(self):
-        """Gets the absolute path to the executable."""
         if getattr(sys, 'frozen', False):
-            # Running as a bundled app (PyInstaller)
-             path = sys.executable
+            path = sys.executable
         else:
-            # Running as a script
-             path = os.path.abspath(sys.argv[0])
-             # If running via 'python -m src.main', argv[0] might be '-m'
-             if sys.argv[0] == '-m': 
-                 # Attempt to find the main script file path
-                 import inspect
-                 frame = inspect.currentframe()
-                 while frame.f_back:
-                     frame = frame.f_back
-                     module_name = frame.f_globals.get('__name__')
-                     if module_name == '__main__':
-                         path = os.path.abspath(frame.f_code.co_filename)
-                         break
-                 else: # Fallback if __main__ not found in call stack
-                      path = os.path.abspath(os.getcwd()) # Less ideal, but a fallback
-             elif not os.path.isabs(path):
-                  # Handle relative paths if not running with -m
-                  path = os.path.abspath(os.path.join(os.getcwd(), path))
+            path = os.path.abspath(sys.argv[0])
+            if sys.argv[0] == '-m':
+                import inspect
+                frame = inspect.currentframe()
+                while frame.f_back:
+                    frame = frame.f_back
+                    module_name = frame.f_globals.get('__name__')
+                    if module_name == '__main__':
+                        path = os.path.abspath(frame.f_code.co_filename)
+                        break
+                else:
+                    path = os.path.abspath(os.getcwd())
+            elif not os.path.isabs(path):
+                path = os.path.abspath(os.path.join(os.getcwd(), path))
 
-        # On Windows, ensure path is quoted if it contains spaces for registry/desktop files
         if platform.system() == "Windows" and ' ' in path:
-              return f'"{path}"'
+            return f'"{path}"'
         return path
 
     def _get_windows_registry_key(self, access):
         import winreg
         try:
             return winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, access)
-        except OSError as e:
-            logger.error(f"Failed to open registry key: {e}")
+        except OSError:
             return None
 
     def _is_windows_autostart_enabled(self):
@@ -1127,8 +1044,7 @@ class MainWindow(QMainWindow):
         except FileNotFoundError:
             winreg.CloseKey(key)
             return False
-        except OSError as e:
-            logger.error(f"Error checking Windows autostart registry value: {e}")
+        except OSError:
             if key: winreg.CloseKey(key)
             return False
 
@@ -1142,17 +1058,14 @@ class MainWindow(QMainWindow):
         try:
             if enabled:
                 winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, app_path)
-                logger.info(f"Enabled Windows autostart: {APP_NAME} -> {app_path}")
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
-                    logger.info(f"Disabled Windows autostart: {APP_NAME}")
                 except FileNotFoundError:
-                    logger.info(f"Windows autostart entry not found for {APP_NAME}, nothing to disable.")
+                    pass
             winreg.CloseKey(key)
             return True
-        except OSError as e:
-            logger.error(f"Failed to set Windows autostart: {e}")
+        except OSError:
             if key: winreg.CloseKey(key)
             raise
 
@@ -1166,32 +1079,25 @@ class MainWindow(QMainWindow):
     def _set_linux_autostart(self, enabled: bool):
         desktop_file_path = self._get_linux_autostart_path()
         autostart_dir = desktop_file_path.parent
-
         try:
             if enabled:
                 autostart_dir.mkdir(parents=True, exist_ok=True)
-                
                 exec_path = self._get_executable_path()
                 icon_path = os.path.abspath(get_resource_path('assets/icon.png'))
-                
                 desktop_content = f"""[Desktop Entry]
 Type=Application
 Name={APP_NAME}
 Exec={exec_path}
 Icon={icon_path}
-Comment=Snipaste OCR Tool based on PaddleOCR
+Comment=Snipaste OCR Tool with Pin and Auto Translation
 Terminal=false
 X-GNOME-Autostart-enabled=true
 """
                 desktop_file_path.write_text(desktop_content, encoding='utf-8')
-                logger.info(f"Enabled Linux autostart: Created {desktop_file_path}")
             else:
                 if desktop_file_path.exists():
                     desktop_file_path.unlink()
-                    logger.info(f"Disabled Linux autostart: Removed {desktop_file_path}")
-                else:
-                     logger.info(f"Linux autostart file not found for {APP_NAME}, nothing to disable.")
             return True
-        except (OSError, PermissionError, Exception) as e:
+        except Exception as e:
             logger.error(f"Failed to set Linux autostart: {e}")
             raise

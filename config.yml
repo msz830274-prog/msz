@@ -1,9 +1,25 @@
+hotkeys:
+  clipboard_pin: Alt+W
+  snip: Ctrl+2
+  snip_and_pin: Ctrl+3
 snipaste:
-  modelpath:
-  path:
+  auto_translate: false
+  clipboard_monitor_enabled: false
+  modelpath: D:/jietu/models
+  monitor_folder_enabled: false
+  path: D:\jietu\screenshots
   preview_enabled: true
 translation:
   from_lang: auto
-  secret_id: secret_id
-  secret_key: secret_key
+  provider: free
+  secret_id: ''
+  secret_key: ''
   to_lang: zh
+ocr:
+  enhance_contrast: true
+  super_resolution: true
+  max_side_len: 2560
+  det_db_thresh: 0.2
+  det_db_box_thresh: 0.5
+  det_db_unclip_ratio: 1.8
+
